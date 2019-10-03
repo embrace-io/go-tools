@@ -1,15 +1,14 @@
 package pkg
 
-type t struct{} // MATCH /t is unused/
+type t struct{} // want `t`
 
 func (t) fragment() {}
 
-func fn() bool { // MATCH /fn is unused/
+func fn() bool { // want `fn`
 	var v interface{} = t{}
 	switch obj := v.(type) {
-	// XXX it shouldn't report fragment(), because fn is unused
 	case interface {
-		fragment() // MATCH /fragment is unused/
+		fragment()
 	}:
 		obj.fragment()
 	}

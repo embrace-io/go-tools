@@ -4,16 +4,18 @@ import (
 	"go/ast"
 	"go/types"
 
-	"honnef.co/go/tools/lint"
+	"golang.org/x/tools/go/analysis"
+	"honnef.co/go/tools/code"
+	"honnef.co/go/tools/internal/passes/buildssa"
 	. "honnef.co/go/tools/lint/lintdsl"
 	"honnef.co/go/tools/ssa"
 )
 
-func CheckRangeStringRunes(j *lint.Job) {
-	for _, ssafn := range j.Program.InitialFunctions {
+func CheckRangeStringRunes(pass *analysis.Pass) (interface{}, error) {
+	for _, ssafn := range pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA).SrcFuncs {
 		fn := func(node ast.Node) bool {
 			rng, ok := node.(*ast.RangeStmt)
-			if !ok || !IsBlank(rng.Key) {
+			if !ok || !code.IsBlank(rng.Key) {
 				return true
 			}
 
@@ -46,7 +48,7 @@ func CheckRangeStringRunes(j *lint.Job) {
 
 			// Expect two refs: one for obtaining the length of the slice,
 			// one for accessing the elements
-			if len(FilterDebug(*refs)) != 2 {
+			if len(code.FilterDebug(*refs)) != 2 {
 				// TODO(dh): right now, we check that only one place
 				// refers to our slice. This will miss cases such as
 				// ranging over the slice twice. Ideally, we'd ensure that
@@ -59,10 +61,11 @@ func CheckRangeStringRunes(j *lint.Job) {
 				return true
 			}
 
-			j.Errorf(rng, "should range over string, not []rune(string)")
+			pass.Reportf(rng.Pos(), "should range over string, not []rune(string)")
 
 			return true
 		}
 		Inspect(ssafn.Syntax(), fn)
 	}
+	return nil, nil
 }

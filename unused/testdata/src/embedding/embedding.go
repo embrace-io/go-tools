@@ -27,8 +27,8 @@ type I2 interface {
 
 type t3 struct{}
 type t4 struct {
-	x int // MATCH /x is unused/
-	y int // MATCH /y is unused/
+	x int // want `x`
+	y int // want `y`
 	t3
 }
 
@@ -55,4 +55,23 @@ type T5 struct {
 
 type t6 struct {
 	F int
+}
+
+type t7 struct{ X int }
+type t8 struct{ t7 }
+type t9 struct{ t8 }
+
+var _ = t9{}
+
+type t10 struct{}
+
+func (*t10) Foo() {}
+
+type t11 struct{ t10 }
+
+var _ = t11{}
+
+type i5 interface{}
+type I6 interface {
+	i5
 }

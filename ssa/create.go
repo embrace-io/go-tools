@@ -95,6 +95,7 @@ func memberFromObject(pkg *Package, obj types.Object, syntax ast.Node) {
 			Pkg:       pkg,
 			Prog:      pkg.Prog,
 		}
+		fn.initHTML(pkg.printFunc)
 		if syntax == nil {
 			fn.Synthetic = "loaded from gc object file"
 		}
@@ -164,12 +165,13 @@ func membersFromDecl(pkg *Package, decl ast.Decl) {
 //
 func (prog *Program) CreatePackage(pkg *types.Package, files []*ast.File, info *types.Info, importable bool) *Package {
 	p := &Package{
-		Prog:    prog,
-		Members: make(map[string]Member),
-		values:  make(map[types.Object]Value),
-		Pkg:     pkg,
-		info:    info,  // transient (CREATE and BUILD phases)
-		files:   files, // transient (CREATE and BUILD phases)
+		Prog:      prog,
+		Members:   make(map[string]Member),
+		values:    make(map[types.Object]Value),
+		Pkg:       pkg,
+		info:      info,  // transient (CREATE and BUILD phases)
+		files:     files, // transient (CREATE and BUILD phases)
+		printFunc: prog.PrintFunc,
 	}
 
 	// Add init() function.
@@ -180,6 +182,7 @@ func (prog *Program) CreatePackage(pkg *types.Package, files []*ast.File, info *
 		Pkg:       p,
 		Prog:      prog,
 	}
+	p.init.initHTML(prog.PrintFunc)
 	p.Members[p.init.name] = p.init
 
 	// CREATE phase.
@@ -209,15 +212,13 @@ func (prog *Program) CreatePackage(pkg *types.Package, files []*ast.File, info *
 		}
 	}
 
-	if prog.mode&BareInits == 0 {
-		// Add initializer guard variable.
-		initguard := &Global{
-			Pkg:  p,
-			name: "init$guard",
-			typ:  types.NewPointer(tBool),
-		}
-		p.Members[initguard.Name()] = initguard
+	// Add initializer guard variable.
+	initguard := &Global{
+		Pkg:  p,
+		name: "init$guard",
+		typ:  types.NewPointer(tBool),
 	}
+	p.Members[initguard.Name()] = initguard
 
 	if prog.mode&GlobalDebug != 0 {
 		p.SetDebugMode(true)
@@ -251,12 +252,19 @@ func (prog *Program) AllPackages() []*Package {
 	return pkgs
 }
 
-// ImportedPackage returns the importable SSA Package whose import
-// path is path, or nil if no such SSA package has been created.
+// ImportedPackage returns the importable Package whose PkgPath
+// is path, or nil if no such Package has been created.
 //
-// Not all packages are importable.  For example, no import
-// declaration can resolve to the x_test package created by 'go test'
-// or the ad-hoc main package created 'go build foo.go'.
+// A parameter to CreatePackage determines whether a package should be
+// considered importable. For example, no import declaration can resolve
+// to the ad-hoc main package created by 'go build foo.go'.
+//
+// TODO(adonovan): rethink this function and the "importable" concept;
+// most packages are importable. This function assumes that all
+// types.Package.Path values are unique within the ssa.Program, which is
+// false---yet this function remains very convenient.
+// Clients should use (*Program).Package instead where possible.
+// SSA doesn't really need a string-keyed map of packages.
 //
 func (prog *Program) ImportedPackage(path string) *Package {
 	return prog.imported[path]

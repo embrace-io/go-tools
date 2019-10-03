@@ -40,7 +40,6 @@ package ssa
 
 import (
 	"fmt"
-	"go/token"
 	"go/types"
 	"math/big"
 	"os"
@@ -65,31 +64,25 @@ const debugLifting = false
 type domFrontier [][]*BasicBlock
 
 func (df domFrontier) add(u, v *BasicBlock) {
-	p := &df[u.Index]
-	*p = append(*p, v)
+	df[u.Index] = append(df[u.Index], v)
 }
 
-// build builds the dominance frontier df for the dominator (sub)tree
-// rooted at u, using the Cytron et al. algorithm.
+// build builds the dominance frontier df for the dominator tree of
+// fn, using the algorithm found in A Simple, Fast Dominance
+// Algorithm, Figure 5.
 //
 // TODO(adonovan): opt: consider Berlin approach, computing pruned SSA
 // by pruning the entire IDF computation, rather than merely pruning
 // the DF -> IDF step.
-func (df domFrontier) build(u *BasicBlock) {
-	// Encounter each node u in postorder of dom tree.
-	for _, child := range u.dom.children {
-		df.build(child)
-	}
-	for _, vb := range u.Succs {
-		if v := vb.dom; v.idom != u {
-			df.add(u, vb)
-		}
-	}
-	for _, w := range u.dom.children {
-		for _, vb := range df[w.Index] {
-			// TODO(adonovan): opt: use word-parallel bitwise union.
-			if v := vb.dom; v.idom != u {
-				df.add(u, vb)
+func (df domFrontier) build(fn *Function) {
+	for _, b := range fn.Blocks {
+		if len(b.Preds) >= 2 {
+			for _, p := range b.Preds {
+				runner := p
+				for runner != b.dom.idom {
+					df.add(runner, b)
+					runner = runner.dom.idom
+				}
 			}
 		}
 	}
@@ -97,10 +90,7 @@ func (df domFrontier) build(u *BasicBlock) {
 
 func buildDomFrontier(fn *Function) domFrontier {
 	df := make(domFrontier, len(fn.Blocks))
-	df.build(fn.Blocks[0])
-	if fn.Recover != nil {
-		df.build(fn.Recover)
-	}
+	df.build(fn)
 	return df
 }
 
@@ -175,11 +165,6 @@ func lift(fn *Function) {
 	// instructions.
 	usesDefer := false
 
-	// A counter used to generate ~unique ids for Phi nodes, as an
-	// aid to debugging.  We use large numbers to make them highly
-	// visible.  All nodes are renumbered later.
-	fresh := 1000
-
 	// Determine which allocs we can lift and number them densely.
 	// The renaming phase uses this numbering for compact maps.
 	numAllocs := 0
@@ -190,7 +175,7 @@ func lift(fn *Function) {
 			switch instr := instr.(type) {
 			case *Alloc:
 				index := -1
-				if liftAlloc(df, instr, newPhis, &fresh) {
+				if liftAlloc(df, instr, newPhis) {
 					index = numAllocs
 					numAllocs++
 				}
@@ -341,10 +326,10 @@ func phiHasDirectReferrer(phi *Phi) bool {
 	return false
 }
 
-type blockSet struct{ big.Int } // (inherit methods from Int)
+type BlockSet struct{ big.Int } // (inherit methods from Int)
 
 // add adds b to the set and returns true if the set changed.
-func (s *blockSet) add(b *BasicBlock) bool {
+func (s *BlockSet) Add(b *BasicBlock) bool {
 	i := b.Index
 	if s.Bit(i) != 0 {
 		return false
@@ -353,9 +338,13 @@ func (s *blockSet) add(b *BasicBlock) bool {
 	return true
 }
 
+func (s *BlockSet) Has(b *BasicBlock) bool {
+	return s.Bit(b.Index) == 1
+}
+
 // take removes an arbitrary element from a set s and
 // returns its index, or returns -1 if empty.
-func (s *blockSet) take() int {
+func (s *BlockSet) Take() int {
 	l := s.BitLen()
 	for i := 0; i < l; i++ {
 		if s.Bit(i) == 1 {
@@ -380,10 +369,7 @@ type newPhiMap map[*BasicBlock][]newPhi
 // liftAlloc determines whether alloc can be lifted into registers,
 // and if so, it populates newPhis with all the φ-nodes it may require
 // and returns true.
-//
-// fresh is a source of fresh ids for phi nodes.
-//
-func liftAlloc(df domFrontier, alloc *Alloc, newPhis newPhiMap, fresh *int) bool {
+func liftAlloc(df domFrontier, alloc *Alloc, newPhis newPhiMap) bool {
 	// Don't lift aggregates into registers, because we don't have
 	// a way to express their zero-constants.
 	switch deref(alloc.Type()).Underlying().(type) {
@@ -393,7 +379,7 @@ func liftAlloc(df domFrontier, alloc *Alloc, newPhis newPhiMap, fresh *int) bool
 
 	// Don't lift named return values in functions that defer
 	// calls that may recover from panic.
-	if fn := alloc.Parent(); fn.Recover != nil {
+	if fn := alloc.Parent(); fn.hasDefer {
 		for _, nr := range fn.namedResults {
 			if nr == alloc {
 				return false
@@ -403,7 +389,7 @@ func liftAlloc(df domFrontier, alloc *Alloc, newPhis newPhiMap, fresh *int) bool
 
 	// Compute defblocks, the set of blocks containing a
 	// definition of the alloc cell.
-	var defblocks blockSet
+	var defblocks BlockSet
 	for _, instr := range *alloc.Referrers() {
 		// Bail out if we discover the alloc is not liftable;
 		// the only operations permitted to use the alloc are
@@ -416,11 +402,8 @@ func liftAlloc(df domFrontier, alloc *Alloc, newPhis newPhiMap, fresh *int) bool
 			if instr.Addr != alloc {
 				panic("Alloc.Referrers is inconsistent")
 			}
-			defblocks.add(instr.Block())
-		case *UnOp:
-			if instr.Op != token.MUL {
-				return false // not a load
-			}
+			defblocks.Add(instr.Block())
+		case *Load:
 			if instr.X != alloc {
 				panic("Alloc.Referrers is inconsistent")
 			}
@@ -431,7 +414,7 @@ func liftAlloc(df domFrontier, alloc *Alloc, newPhis newPhiMap, fresh *int) bool
 		}
 	}
 	// The Alloc itself counts as a (zero) definition of the cell.
-	defblocks.add(alloc.Block())
+	defblocks.Add(alloc.Block())
 
 	if debugLifting {
 		fmt.Fprintln(os.Stderr, "\tlifting ", alloc, alloc.Name())
@@ -448,27 +431,24 @@ func liftAlloc(df domFrontier, alloc *Alloc, newPhis newPhiMap, fresh *int) bool
 	//
 	// TODO(adonovan): opt: recycle slice storage for W,
 	// hasAlready, defBlocks across liftAlloc calls.
-	var hasAlready blockSet
+	var hasAlready BlockSet
 
 	// Initialize W and work to defblocks.
-	var work blockSet = defblocks // blocks seen
-	var W blockSet                // blocks to do
+	var work BlockSet = defblocks // blocks seen
+	var W BlockSet                // blocks to do
 	W.Set(&defblocks.Int)
 
 	// Traverse iterated dominance frontier, inserting φ-nodes.
-	for i := W.take(); i != -1; i = W.take() {
+	for i := W.Take(); i != -1; i = W.Take() {
 		u := fn.Blocks[i]
 		for _, v := range df[u.Index] {
-			if hasAlready.add(v) {
+			if hasAlready.Add(v) {
 				// Create φ-node.
 				// It will be prepended to v.Instrs later, if needed.
 				phi := &Phi{
 					Edges:   make([]Value, len(v.Preds)),
 					Comment: alloc.Comment,
 				}
-				// This is merely a debugging aid:
-				phi.setNum(*fresh)
-				*fresh++
 
 				phi.pos = alloc.Pos()
 				phi.setType(deref(alloc.Type()))
@@ -478,8 +458,8 @@ func liftAlloc(df domFrontier, alloc *Alloc, newPhis newPhiMap, fresh *int) bool
 				}
 				newPhis[v] = append(newPhis[v], newPhi{phi, alloc})
 
-				if work.add(v) {
-					W.add(v)
+				if work.Add(v) {
+					W.Add(v)
 				}
 			}
 		}
@@ -515,10 +495,10 @@ func replaceAll(x, y Value) {
 // renamed returns the value to which alloc is being renamed,
 // constructing it lazily if it's the implicit zero initialization.
 //
-func renamed(renaming []Value, alloc *Alloc) Value {
+func renamed(fn *Function, renaming []Value, alloc *Alloc) Value {
 	v := renaming[alloc.index]
 	if v == nil {
-		v = zeroConst(deref(alloc.Type()))
+		v = emitConst(fn, zeroConst(deref(alloc.Type())))
 		renaming[alloc.index] = v
 	}
 	return v
@@ -565,37 +545,36 @@ func rename(u *BasicBlock, renaming []Value, newPhis newPhiMap) {
 					fmt.Fprintf(os.Stderr, "\tkill store %s; new value: %s\n",
 						instr, instr.Val.Name())
 				}
-				// Remove the store from the referrer list of the stored value.
-				if refs := instr.Val.Referrers(); refs != nil {
-					*refs = removeInstr(*refs, instr)
+				for _, op := range instr.Operands(nil) {
+					if refs := (*op).Referrers(); refs != nil {
+						*refs = removeInstr(*refs, instr)
+					}
 				}
 				// Delete the Store.
 				u.Instrs[i] = nil
 				u.gaps++
 			}
 
-		case *UnOp:
-			if instr.Op == token.MUL {
-				if alloc, ok := instr.X.(*Alloc); ok && alloc.index >= 0 { // load of Alloc cell
-					newval := renamed(renaming, alloc)
-					if debugLifting {
-						fmt.Fprintf(os.Stderr, "\tupdate load %s = %s with %s\n",
-							instr.Name(), instr, newval.Name())
-					}
-					// Replace all references to
-					// the loaded value by the
-					// dominating stored value.
-					replaceAll(instr, newval)
-					// Delete the Load.
-					u.Instrs[i] = nil
-					u.gaps++
+		case *Load:
+			if alloc, ok := instr.X.(*Alloc); ok && alloc.index >= 0 { // load of Alloc cell
+				newval := renamed(u.Parent(), renaming, alloc)
+				if debugLifting {
+					fmt.Fprintf(os.Stderr, "\tupdate load %s = %s with %s\n",
+						instr.Name(), instr, newval.Name())
 				}
+				// Replace all references to
+				// the loaded value by the
+				// dominating stored value.
+				replaceAll(instr, newval)
+				// Delete the Load.
+				u.Instrs[i] = nil
+				u.gaps++
 			}
 
 		case *DebugRef:
 			if alloc, ok := instr.X.(*Alloc); ok && alloc.index >= 0 { // ref of Alloc cell
 				if instr.IsAddr {
-					instr.X = renamed(renaming, alloc)
+					instr.X = renamed(u.Parent(), renaming, alloc)
 					instr.IsAddr = false
 
 					// Add DebugRef to instr.X's referrers.
@@ -625,7 +604,7 @@ func rename(u *BasicBlock, renaming []Value, newPhis newPhiMap) {
 		for _, np := range phis {
 			phi := np.phi
 			alloc := np.alloc
-			newval := renamed(renaming, alloc)
+			newval := renamed(u.Parent(), renaming, alloc)
 			if debugLifting {
 				fmt.Fprintf(os.Stderr, "\tsetphi %s edge %s -> %s (#%d) (alloc=%s) := %s\n",
 					phi.Name(), u, v, i, alloc.Name(), newval.Name())

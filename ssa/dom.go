@@ -27,8 +27,7 @@ import (
 
 // Idom returns the block that immediately dominates b:
 // its parent in the dominator tree, if any.
-// Neither the entry node (b.Index==0) nor recover node
-// (b==b.Parent().Recover()) have a parent.
+// The entry node (b.Index==0) does not have a parent.
 //
 func (b *BasicBlock) Idom() *BasicBlock { return b.dom.idom }
 
@@ -53,7 +52,7 @@ func (a byDomPreorder) Less(i, j int) bool { return a[i].dom.pre < a[j].dom.pre 
 //
 func (f *Function) DomPreorder() []*BasicBlock {
 	n := len(f.Blocks)
-	order := make(byDomPreorder, n, n)
+	order := make(byDomPreorder, n)
 	copy(order, f.Blocks)
 	sort.Sort(order)
 	return order
@@ -66,144 +65,91 @@ type domInfo struct {
 	pre, post int32         // pre- and post-order numbering within domtree
 }
 
-// ltState holds the working state for Lengauer-Tarjan algorithm
-// (during which domInfo.pre is repurposed for CFG DFS preorder number).
-type ltState struct {
-	// Each slice is indexed by b.Index.
-	sdom     []*BasicBlock // b's semidominator
-	parent   []*BasicBlock // b's parent in DFS traversal of CFG
-	ancestor []*BasicBlock // b's ancestor with least sdom
-}
-
-// dfs implements the depth-first search part of the LT algorithm.
-func (lt *ltState) dfs(v *BasicBlock, i int32, preorder []*BasicBlock) int32 {
-	preorder[i] = v
-	v.dom.pre = i // For now: DFS preorder of spanning tree of CFG
-	i++
-	lt.sdom[v.Index] = v
-	lt.link(nil, v)
-	for _, w := range v.Succs {
-		if lt.sdom[w.Index] == nil {
-			lt.parent[w.Index] = v
-			i = lt.dfs(w, i, preorder)
-		}
-	}
-	return i
-}
-
-// eval implements the EVAL part of the LT algorithm.
-func (lt *ltState) eval(v *BasicBlock) *BasicBlock {
-	// TODO(adonovan): opt: do path compression per simple LT.
-	u := v
-	for ; lt.ancestor[v.Index] != nil; v = lt.ancestor[v.Index] {
-		if lt.sdom[v.Index].dom.pre < lt.sdom[u.Index].dom.pre {
-			u = v
-		}
-	}
-	return u
-}
-
-// link implements the LINK part of the LT algorithm.
-func (lt *ltState) link(v, w *BasicBlock) {
-	lt.ancestor[w.Index] = v
-}
-
 // buildDomTree computes the dominator tree of f using the LT algorithm.
 // Precondition: all blocks are reachable (e.g. optimizeBlocks has been run).
 //
-func buildDomTree(f *Function) {
+func buildDomTree(fn *Function) {
 	// The step numbers refer to the original LT paper; the
 	// reordering is due to Georgiadis.
 
 	// Clear any previous domInfo.
-	for _, b := range f.Blocks {
+	for _, b := range fn.Blocks {
 		b.dom = domInfo{}
 	}
 
-	n := len(f.Blocks)
-	// Allocate space for 5 contiguous [n]*BasicBlock arrays:
-	// sdom, parent, ancestor, preorder, buckets.
-	space := make([]*BasicBlock, 5*n, 5*n)
-	lt := ltState{
-		sdom:     space[0:n],
-		parent:   space[n : 2*n],
-		ancestor: space[2*n : 3*n],
+	idoms := make([]*BasicBlock, len(fn.Blocks))
+
+	order := make([]*BasicBlock, 0, len(fn.Blocks))
+	var seen BlockSet
+	var dfs func(b *BasicBlock)
+	dfs = func(b *BasicBlock) {
+		if !seen.Add(b) {
+			return
+		}
+		for _, succ := range b.Succs {
+			dfs(succ)
+		}
+		order = append(order, b)
+		b.post = len(order) - 1
+	}
+	dfs(fn.Blocks[0])
+
+	for i := 0; i < len(order)/2; i++ {
+		o := len(order) - i - 1
+		order[i], order[o] = order[o], order[i]
 	}
 
-	// Step 1.  Number vertices by depth-first preorder.
-	preorder := space[3*n : 4*n]
-	root := f.Blocks[0]
-	prenum := lt.dfs(root, 0, preorder)
-	recover := f.Recover
-	if recover != nil {
-		lt.dfs(recover, prenum, preorder)
-	}
+	idoms[fn.Blocks[0].Index] = fn.Blocks[0]
+	changed := true
+	for changed {
+		changed = false
+		// iterate over all nodes in reverse postorder, except for the
+		// entry node
+		for _, b := range order[1:] {
+			var newIdom *BasicBlock
+			for _, p := range b.Preds {
+				if idoms[p.Index] == nil {
+					continue
+				}
+				if newIdom == nil {
+					newIdom = p
+				} else {
+					finger1 := p
+					finger2 := newIdom
+					for finger1 != finger2 {
+						for finger1.post < finger2.post {
+							finger1 = idoms[finger1.Index]
+						}
+						for finger2.post < finger1.post {
+							finger2 = idoms[finger2.Index]
+						}
+					}
+					newIdom = finger1
+				}
+			}
 
-	buckets := space[4*n : 5*n]
-	copy(buckets, preorder)
-
-	// In reverse preorder...
-	for i := int32(n) - 1; i > 0; i-- {
-		w := preorder[i]
-
-		// Step 3. Implicitly define the immediate dominator of each node.
-		for v := buckets[i]; v != w; v = buckets[v.dom.pre] {
-			u := lt.eval(v)
-			if lt.sdom[u.Index].dom.pre < i {
-				v.dom.idom = u
-			} else {
-				v.dom.idom = w
+			if idoms[b.Index] != newIdom {
+				idoms[b.Index] = newIdom
+				changed = true
 			}
 		}
+	}
 
-		// Step 2. Compute the semidominators of all nodes.
-		lt.sdom[w.Index] = lt.parent[w.Index]
-		for _, v := range w.Preds {
-			u := lt.eval(v)
-			if lt.sdom[u.Index].dom.pre < lt.sdom[w.Index].dom.pre {
-				lt.sdom[w.Index] = lt.sdom[u.Index]
-			}
+	for i, b := range idoms {
+		fn.Blocks[i].dom.idom = b
+		if i == b.Index {
+			continue
 		}
-
-		lt.link(lt.parent[w.Index], w)
-
-		if lt.parent[w.Index] == lt.sdom[w.Index] {
-			w.dom.idom = lt.parent[w.Index]
-		} else {
-			buckets[i] = buckets[lt.sdom[w.Index].dom.pre]
-			buckets[lt.sdom[w.Index].dom.pre] = w
-		}
+		b.dom.children = append(b.dom.children, fn.Blocks[i])
 	}
 
-	// The final 'Step 3' is now outside the loop.
-	for v := buckets[0]; v != root; v = buckets[v.dom.pre] {
-		v.dom.idom = root
-	}
+	numberDomTree(fn.Blocks[0], 0, 0)
 
-	// Step 4. Explicitly define the immediate dominator of each
-	// node, in preorder.
-	for _, w := range preorder[1:] {
-		if w == root || w == recover {
-			w.dom.idom = nil
-		} else {
-			if w.dom.idom != lt.sdom[w.Index] {
-				w.dom.idom = w.dom.idom.dom.idom
-			}
-			// Calculate Children relation as inverse of Idom.
-			w.dom.idom.dom.children = append(w.dom.idom.dom.children, w)
-		}
-	}
-
-	pre, post := numberDomTree(root, 0, 0)
-	if recover != nil {
-		numberDomTree(recover, pre, post)
-	}
-
-	// printDomTreeDot(os.Stderr, f)        // debugging
+	// printDomTreeDot(os.Stderr, f) // debugging
 	// printDomTreeText(os.Stderr, root, 0) // debugging
 
-	if f.Prog.mode&SanityCheckFunctions != 0 {
-		sanityCheckDomTree(f)
+	if fn.Prog.mode&SanityCheckFunctions != 0 {
+		sanityCheckDomTree(fn)
 	}
 }
 
@@ -243,8 +189,8 @@ func sanityCheckDomTree(f *Function) {
 	all.Set(one).Lsh(&all, uint(n)).Sub(&all, one)
 
 	// Initialization.
-	for i, b := range f.Blocks {
-		if i == 0 || b == f.Recover {
+	for i := range f.Blocks {
+		if i == 0 {
 			// A root is dominated only by itself.
 			D[i].SetBit(&D[0], 0, 1)
 		} else {
@@ -258,7 +204,7 @@ func sanityCheckDomTree(f *Function) {
 	for changed := true; changed; {
 		changed = false
 		for i, b := range f.Blocks {
-			if i == 0 || b == f.Recover {
+			if i == 0 {
 				continue
 			}
 			// Compute intersection across predecessors.
@@ -276,14 +222,10 @@ func sanityCheckDomTree(f *Function) {
 	}
 
 	// Check the entire relation.  O(n^2).
-	// The Recover block (if any) must be treated specially so we skip it.
 	ok := true
 	for i := 0; i < n; i++ {
 		for j := 0; j < n; j++ {
 			b, c := f.Blocks[i], f.Blocks[j]
-			if c == f.Recover {
-				continue
-			}
 			actual := b.Dominates(c)
 			expected := D[j].Bit(i) == 1
 			if actual != expected {
@@ -310,6 +252,7 @@ func sanityCheckDomTree(f *Function) {
 // Printing functions ----------------------------------------
 
 // printDomTree prints the dominator tree as text, using indentation.
+//lint:ignore U1000 used during debugging
 func printDomTreeText(buf *bytes.Buffer, v *BasicBlock, indent int) {
 	fmt.Fprintf(buf, "%*s%s\n", 4*indent, "", v)
 	for _, child := range v.dom.children {
@@ -319,6 +262,7 @@ func printDomTreeText(buf *bytes.Buffer, v *BasicBlock, indent int) {
 
 // printDomTreeDot prints the dominator tree of f in AT&T GraphViz
 // (.dot) format.
+//lint:ignore U1000 used during debugging
 func printDomTreeDot(buf *bytes.Buffer, f *Function) {
 	fmt.Fprintln(buf, "//", f)
 	fmt.Fprintln(buf, "digraph domtree {")

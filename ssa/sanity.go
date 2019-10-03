@@ -146,7 +146,8 @@ func (s *sanity) checkInstr(idx int, instr Instruction) {
 	case *Go:
 	case *Index:
 	case *IndexAddr:
-	case *Lookup:
+	case *MapLookup:
+	case *StringLookup:
 	case *MakeChan:
 	case *MakeClosure:
 		numFree := len(instr.Fn.(*Function).FreeVars)
@@ -176,7 +177,10 @@ func (s *sanity) checkInstr(idx int, instr Instruction) {
 	case *DebugRef:
 	case *BlankStore:
 	case *Sigma:
-		// TODO(adonovan): implement checks.
+	case *Load:
+	case *Parameter:
+	case *Const:
+	case *Recv:
 	default:
 		panic(fmt.Sprintf("Unknown instruction type: %T", instr))
 	}
@@ -196,7 +200,9 @@ func (s *sanity) checkInstr(idx int, instr Instruction) {
 		} else if t == tRangeIter {
 			// not a proper type; ignore.
 		} else if b, ok := t.Underlying().(*types.Basic); ok && b.Info()&types.IsUntyped != 0 {
-			s.errorf("instruction has 'untyped' result: %s = %s : %s", v.Name(), v, t)
+			if _, ok := v.(*Const); !ok {
+				s.errorf("instruction has 'untyped' result: %s = %s : %s", v.Name(), v, t)
+			}
 		}
 		s.checkReferrerList(v)
 	}
@@ -239,8 +245,8 @@ func (s *sanity) checkFinalInstr(instr Instruction) {
 		}
 
 	case *Panic:
-		if nsuccs := len(s.block.Succs); nsuccs != 0 {
-			s.errorf("Panic-terminated block has %d successors; expected none", nsuccs)
+		if nsuccs := len(s.block.Succs); nsuccs != 1 {
+			s.errorf("Panic-terminated block has %d successors; expected one", nsuccs)
 			return
 		}
 
@@ -260,9 +266,8 @@ func (s *sanity) checkBlock(b *BasicBlock, index int) {
 	}
 
 	// Check all blocks are reachable.
-	// (The entry block is always implicitly reachable,
-	// as is the Recover block, if any.)
-	if (index > 0 && b != b.parent.Recover) && len(b.Preds) == 0 {
+	// (The entry block is always implicitly reachable.)
+	if index > 0 && len(b.Preds) == 0 {
 		s.warnf("unreachable block")
 		if b.Instrs == nil {
 			// Since this block is about to be pruned,
@@ -410,8 +415,8 @@ func (s *sanity) checkFunction(fn *Function) bool {
 		s.errorf("nil Prog")
 	}
 
-	fn.String()            // must not crash
-	fn.RelString(fn.pkg()) // must not crash
+	_ = fn.String()            // must not crash
+	_ = fn.RelString(fn.pkg()) // must not crash
 
 	// All functions have a package, except delegates (which are
 	// shared across packages, or duplicated as weak symbols in a
@@ -448,6 +453,18 @@ func (s *sanity) checkFunction(fn *Function) bool {
 		if p.Parent() != fn {
 			s.errorf("Param %s at index %d has wrong parent", p.Name(), i)
 		}
+		// Check common suffix of Signature and Params match type.
+		if sig := fn.Signature; sig != nil {
+			j := i - len(fn.Params) + sig.Params().Len() // index within sig.Params
+			if j < 0 {
+				continue
+			}
+			if !types.Identical(p.Type(), sig.Params().At(j).Type()) {
+				s.errorf("Param %s at index %d has wrong type (%s, versus %s in Signature)", p.Name(), i, p.Type(), sig.Params().At(j).Type())
+
+			}
+		}
+
 		s.checkReferrerList(p)
 	}
 	for i, fv := range fn.FreeVars {
@@ -469,9 +486,6 @@ func (s *sanity) checkFunction(fn *Function) bool {
 		}
 		s.checkBlock(b, i)
 	}
-	if fn.Recover != nil && fn.Blocks[fn.Recover.Index] != fn.Recover {
-		s.errorf("Recover block is not in Blocks slice")
-	}
 
 	s.block = nil
 	for i, anon := range fn.AnonFuncs {
@@ -490,7 +504,7 @@ func sanityCheckPackage(pkg *Package) {
 	if pkg.Pkg == nil {
 		panic(fmt.Sprintf("Package %s has no Object", pkg))
 	}
-	pkg.String() // must not crash
+	_ = pkg.String() // must not crash
 
 	for name, mem := range pkg.Members {
 		if name != mem.Name() {

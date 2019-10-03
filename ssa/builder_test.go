@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//lint:file-ignore SA1019 go/ssa's test suite is built around the deprecated go/loader. We'll leave fixing that to upstream.
+
 package ssa_test
 
 import (
@@ -37,13 +39,13 @@ import (
 )
 
 func main() {
-        var t testing.T
+	var t testing.T
 	t.Parallel()    // static call to external declared method
-        t.Fail()        // static call to promoted external declared method
-        testing.Short() // static call to external package-level function
+	t.Fail()        // static call to promoted external declared method
+	testing.Short() // static call to external package-level function
 
-        var w io.Writer = new(bytes.Buffer)
-        w.Write(nil)    // interface invoke of external declared method
+	var w io.Writer = new(bytes.Buffer)
+	w.Write(nil)    // interface invoke of external declared method
 }
 `
 
@@ -247,13 +249,6 @@ func TestRuntimeTypes(t *testing.T) {
 }
 
 // TestInit tests that synthesized init functions are correctly formed.
-// Bare init functions omit calls to dependent init functions and the use of
-// an init guard. They are useful in cases where the client uses a different
-// calling convention for init functions, or cases where it is easier for a
-// client to analyze bare init functions. Both of these aspects are used by
-// the llgo compiler for simpler integration with gccgo's runtime library,
-// and to simplify the analysis whereby it deduces which stores to globals
-// can be lowered to global initializers.
 func TestInit(t *testing.T) {
 	tests := []struct {
 		mode        ssa.BuilderMode
@@ -265,24 +260,16 @@ func TestInit(t *testing.T) {
 # Synthetic: package initializer
 func init():
 0:                                                                entry P:0 S:2
-	t0 = *init$guard                                                   bool
-	if t0 goto 2 else 1
+	t1 = true:bool                                                     bool
+	t2 = 42:int                                                         int
+	t3 = Load <bool> init$guard                                        bool
+	if t3 goto 2 else 1
 1:                                                           init.start P:1 S:1
-	*init$guard = true:bool
-	t1 = errors.init()                                                   ()
-	*i = 42:int
+	Store {bool} init$guard true:bool
+	t6 = call errors.init()                                              ()
+	Store {int} i 42:int
 	jump 2
 2:                                                            init.done P:2 S:0
-	return
-
-`},
-		{ssa.BareInits, `package B; import _ "errors"; var i int = 42`,
-			`# Name: B.init
-# Package: B
-# Synthetic: package initializer
-func init():
-0:                                                                entry P:0 S:0
-	*i = 42:int
 	return
 
 `},
@@ -495,6 +482,6 @@ func h(error)
 	}
 	if phis != 1 {
 		g.WriteTo(os.Stderr)
-		t.Errorf("expected a single Phi (for the range index), got %d", phis)
+		t.Errorf("expected one Phi node (for the range index), got %d", phis)
 	}
 }

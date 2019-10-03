@@ -9,6 +9,7 @@ package ssa
 import (
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
 )
@@ -27,11 +28,21 @@ func emitNew(f *Function, typ types.Type, pos token.Pos) *Alloc {
 // emitLoad emits to f an instruction to load the address addr into a
 // new temporary, and returns the value so defined.
 //
-func emitLoad(f *Function, addr Value) *UnOp {
-	v := &UnOp{Op: token.MUL, X: addr}
+func emitLoad(f *Function, addr Value) *Load {
+	v := &Load{X: addr}
 	v.setType(deref(addr.Type()))
 	f.emit(v)
 	return v
+}
+
+func emitRecv(f *Function, ch Value, commaOk bool, typ types.Type, pos token.Pos) Value {
+	recv := &Recv{
+		Chan:    ch,
+		CommaOk: commaOk,
+	}
+	recv.setPos(pos)
+	recv.setType(typ)
+	return f.emit(recv)
 }
 
 // emitDebugRef emits to f a DebugRef pseudo-instruction associating
@@ -111,7 +122,7 @@ func emitCompare(f *Function, op token.Token, x, y Value, pos token.Pos) Value {
 	//   if e==true { ... }
 	// even in the case when e's type is an interface.
 	// TODO(adonovan): opt: generalise to x==true, false!=y, etc.
-	if x == vTrue && op == token.EQL {
+	if x, ok := x.(*Const); ok && op == token.EQL && x.Value.Kind() == constant.Bool && constant.BoolVal(x.Value) {
 		if yt, ok := yt.(*types.Basic); ok && yt.Info()&types.IsBoolean != 0 {
 			return y
 		}
@@ -127,6 +138,7 @@ func emitCompare(f *Function, op token.Token, x, y Value, pos token.Pos) Value {
 		x = emitConv(f, x, y.Type())
 	} else if _, ok := y.(*Const); ok {
 		y = emitConv(f, y, x.Type())
+		//lint:ignore SA9003 no-op
 	} else {
 		// other cases, e.g. channels.  No-op.
 	}
@@ -199,12 +211,12 @@ func emitConv(f *Function, val Value, typ types.Type) Value {
 
 		// Untyped nil constant?  Return interface-typed nil constant.
 		if ut_src == tUntypedNil {
-			return nilConst(typ)
+			return emitConst(f, nilConst(typ))
 		}
 
 		// Convert (non-nil) "untyped" literals to their default type.
 		if t, ok := ut_src.(*types.Basic); ok && t.Info()&types.IsUntyped != 0 {
-			val = emitConv(f, val, DefaultType(ut_src))
+			val = emitConv(f, val, types.Default(ut_src))
 		}
 
 		f.Pkg.Prog.needMethodsOf(val.Type())
@@ -221,7 +233,7 @@ func emitConv(f *Function, val Value, typ types.Type) Value {
 			// constant of the destination type and
 			// (initially) the same abstract value.
 			// We don't truncate the value yet.
-			return NewConst(c.Value, typ)
+			return emitConst(f, NewConst(c.Value, typ))
 		}
 
 		// We're converting from constant to non-constant type,
@@ -251,6 +263,8 @@ func emitStore(f *Function, addr, val Value, pos token.Pos) *Store {
 		Val:  emitConv(f, val, deref(addr.Type())),
 		pos:  pos,
 	}
+	// make sure we call getMem after the call to emitConv, which may
+	// itself update the memory state
 	f.emit(s)
 	return s
 }
@@ -425,44 +439,11 @@ func zeroValue(f *Function, t types.Type) Value {
 	case *types.Struct, *types.Array:
 		return emitLoad(f, f.addLocal(t, token.NoPos))
 	default:
-		return zeroConst(t)
+		return emitConst(f, zeroConst(t))
 	}
 }
 
-// createRecoverBlock emits to f a block of code to return after a
-// recovered panic, and sets f.Recover to it.
-//
-// If f's result parameters are named, the code loads and returns
-// their current values, otherwise it returns the zero values of their
-// type.
-//
-// Idempotent.
-//
-func createRecoverBlock(f *Function) {
-	if f.Recover != nil {
-		return // already created
-	}
-	saved := f.currentBlock
-
-	f.Recover = f.newBasicBlock("recover")
-	f.currentBlock = f.Recover
-
-	var results []Value
-	if f.namedResults != nil {
-		// Reload NRPs to form value tuple.
-		for _, r := range f.namedResults {
-			results = append(results, emitLoad(f, r))
-		}
-	} else {
-		R := f.Signature.Results()
-		for i, n := 0, R.Len(); i < n; i++ {
-			T := R.At(i).Type()
-
-			// Return zero value of each result type.
-			results = append(results, zeroValue(f, T))
-		}
-	}
-	f.emit(&Return{Results: results})
-
-	f.currentBlock = saved
+func emitConst(f *Function, c *Const) *Const {
+	f.consts = append(f.consts, c)
+	return c
 }

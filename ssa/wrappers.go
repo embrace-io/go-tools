@@ -73,9 +73,11 @@ func makeWrapper(prog *Program, sel *types.Selection) *Function {
 		Prog:      prog,
 		pos:       obj.Pos(),
 	}
+	fn.initHTML(prog.PrintFunc)
 	fn.startBody()
 	fn.addSpilledParam(recv)
 	createParams(fn, start)
+	// XXX exit block
 
 	indices := sel.Index()
 
@@ -95,8 +97,8 @@ func makeWrapper(prog *Program, sel *types.Selection) *Function {
 			}
 			c.Call.Args = []Value{
 				v,
-				stringConst(deref(sel.Recv()).String()),
-				stringConst(sel.Obj().Name()),
+				emitConst(fn, stringConst(deref(sel.Recv()).String())),
+				emitConst(fn, stringConst(sel.Obj().Name())),
 			}
 			c.setType(v.Type())
 			v = fn.emit(&c)
@@ -141,13 +143,9 @@ func makeWrapper(prog *Program, sel *types.Selection) *Function {
 // start is the index of the first regular parameter to use.
 //
 func createParams(fn *Function, start int) {
-	var last *Parameter
 	tparams := fn.Signature.Params()
 	for i, n := start, tparams.Len(); i < n; i++ {
-		last = fn.addParamObj(tparams.At(i))
-	}
-	if fn.Signature.Variadic() {
-		last.typ = types.NewSlice(last.typ)
+		fn.addParamObj(tparams.At(i))
 	}
 }
 
@@ -195,6 +193,7 @@ func makeBound(prog *Program, obj *types.Func) *Function {
 			Prog:      prog,
 			pos:       obj.Pos(),
 		}
+		fn.initHTML(prog.PrintFunc)
 
 		fv := &FreeVar{name: "recv", typ: recvType(obj), parent: fn}
 		fn.FreeVars = []*FreeVar{fv}

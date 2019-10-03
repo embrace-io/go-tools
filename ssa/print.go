@@ -25,6 +25,9 @@ import (
 // references are package-qualified.
 //
 func relName(v Value, i Instruction) string {
+	if v == nil {
+		return "<nil>"
+	}
 	var from *types.Package
 	if i != nil {
 		from = i.Parent().pkg()
@@ -58,7 +61,7 @@ func relString(m Member, from *types.Package) string {
 
 func (v *Parameter) String() string {
 	from := v.Parent().pkg()
-	return fmt.Sprintf("parameter %s : %s", v.Name(), relType(v.Type(), from))
+	return fmt.Sprintf("parameter %s : %s", v.name, relType(v.Type(), from))
 }
 
 func (v *FreeVar) String() string {
@@ -116,13 +119,13 @@ func printCall(v *CallCommon, prefix string, instr Instruction) string {
 	var b bytes.Buffer
 	b.WriteString(prefix)
 	if !v.IsInvoke() {
-		b.WriteString(relName(v.Value, instr))
+		fmt.Fprintf(&b, "call %s", relName(v.Value, instr))
 	} else {
 		fmt.Fprintf(&b, "invoke %s.%s", relName(v.Value, instr), v.Method.Name())
 	}
 	b.WriteString("(")
 	for i, arg := range v.Args {
-		if i > 0 {
+		if i != 0 {
 			b.WriteString(", ")
 		}
 		b.WriteString(relName(arg, instr))
@@ -148,6 +151,10 @@ func (v *BinOp) String() string {
 
 func (v *UnOp) String() string {
 	return fmt.Sprintf("%s%s%s", v.Op, relName(v.X, v), commaOk(v.CommaOk))
+}
+
+func (v *Load) String() string {
+	return fmt.Sprintf("Load <%s> %s", relType(v.Type(), v.Parent().pkg()), relName(v.X, v))
 }
 
 func printConv(prefix string, v, x Value) string {
@@ -250,8 +257,12 @@ func (v *Index) String() string {
 	return fmt.Sprintf("%s[%s]", relName(v.X, v), relName(v.Index, v))
 }
 
-func (v *Lookup) String() string {
+func (v *MapLookup) String() string {
 	return fmt.Sprintf("%s[%s]%s", relName(v.X, v), relName(v.Index, v), commaOk(v.CommaOk))
+}
+
+func (v *StringLookup) String() string {
+	return fmt.Sprintf("%s[%s]", relName(v.X, v), relName(v.Index, v))
 }
 
 func (v *Range) String() string {
@@ -320,6 +331,10 @@ func (s *Send) String() string {
 	return fmt.Sprintf("send %s <- %s", relName(s.Chan, s), relName(s.X, s))
 }
 
+func (recv *Recv) String() string {
+	return fmt.Sprintf("Recv {%t} %s", recv.CommaOk, relName(recv.Chan, recv))
+}
+
 func (s *Defer) String() string {
 	return printCall(&s.Call, "defer ", s)
 }
@@ -347,7 +362,8 @@ func (s *Select) String() string {
 }
 
 func (s *Store) String() string {
-	return fmt.Sprintf("*%s = %s", relName(s.Addr, s), relName(s.Val, s))
+	return fmt.Sprintf("Store {%s} %s %s",
+		s.Val.Type(), relName(s.Addr, s), relName(s.Val, s))
 }
 
 func (s *BlankStore) String() string {

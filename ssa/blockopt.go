@@ -29,10 +29,6 @@ func markReachable(b *BasicBlock) {
 	}
 }
 
-func DeleteUnreachableBlocks(f *Function) {
-	deleteUnreachableBlocks(f)
-}
-
 // deleteUnreachableBlocks marks all reachable blocks of f and
 // eliminates (nils) all others, including possibly cyclic subgraphs.
 //
@@ -43,9 +39,6 @@ func deleteUnreachableBlocks(f *Function) {
 		b.Index = white
 	}
 	markReachable(f.Blocks[0])
-	if f.Recover != nil {
-		markReachable(f.Recover)
-	}
 	for i, b := range f.Blocks {
 		if b.Index == white {
 			for _, c := range b.Succs {
@@ -121,6 +114,10 @@ func fuseBlocks(f *Function, a *BasicBlock) bool {
 	if len(b.Preds) != 1 {
 		return false
 	}
+	if _, ok := a.Instrs[len(a.Instrs)-1].(*Panic); ok {
+		// panics aren't simple jumps, they have side effects.
+		return false
+	}
 
 	// Degenerate &&/|| ops may result in a straight-line CFG
 	// containing φ-nodes. (Ideally we'd replace such them with
@@ -149,10 +146,6 @@ func fuseBlocks(f *Function, a *BasicBlock) bool {
 
 	f.Blocks[b.Index] = nil // delete b
 	return true
-}
-
-func OptimizeBlocks(f *Function) {
-	optimizeBlocks(f)
 }
 
 // optimizeBlocks() performs some simple block optimizations on a

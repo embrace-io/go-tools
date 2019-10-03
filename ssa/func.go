@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
 	"io"
@@ -21,6 +22,14 @@ import (
 func addEdge(from, to *BasicBlock) {
 	from.Succs = append(from.Succs, to)
 	to.Preds = append(to.Preds, from)
+}
+
+// Control returns the last instruction in the block.
+func (b *BasicBlock) Control() Instruction {
+	if len(b.Instrs) == 0 {
+		return nil
+	}
+	return b.Instrs[len(b.Instrs)-1]
 }
 
 // Parent returns the function that contains block b.
@@ -94,10 +103,6 @@ func (b *BasicBlock) replaceSucc(p, q *BasicBlock) {
 			b.Succs[i] = q
 		}
 	}
-}
-
-func (b *BasicBlock) RemovePred(p *BasicBlock) {
-	b.removePred(p)
 }
 
 // removePred removes all occurrences of p in b's
@@ -174,13 +179,23 @@ func (f *Function) labelledBlock(label *ast.Ident) *lblock {
 // specified name, type and source position.
 //
 func (f *Function) addParam(name string, typ types.Type, pos token.Pos) *Parameter {
-	v := &Parameter{
-		name:   name,
-		typ:    typ,
-		pos:    pos,
-		parent: f,
+	var b *BasicBlock
+	if len(f.Blocks) > 0 {
+		b = f.Blocks[0]
 	}
+	v := &Parameter{
+		name: name,
+	}
+	v.setBlock(b)
+	v.setType(typ)
+	v.setPos(pos)
 	f.Params = append(f.Params, v)
+	if b != nil {
+		// There may be no blocks if this function has no body. We
+		// still create params, but aren't interested in the
+		// instruction.
+		f.Blocks[0].Instrs = append(f.Blocks[0].Instrs, v)
+	}
 	return v
 }
 
@@ -206,15 +221,36 @@ func (f *Function) addSpilledParam(obj types.Object) {
 	f.objects[obj] = spill
 	f.Locals = append(f.Locals, spill)
 	f.emit(spill)
-	f.emit(&Store{Addr: spill, Val: param})
+	emitStore(f, spill, param, 0)
+	// f.emit(&Store{Addr: spill, Val: param})
 }
 
 // startBody initializes the function prior to generating SSA code for its body.
 // Precondition: f.Type() already set.
 //
 func (f *Function) startBody() {
-	f.currentBlock = f.newBasicBlock("entry")
+	entry := f.newBasicBlock("entry")
+	f.currentBlock = entry
 	f.objects = make(map[types.Object]Value) // needed for some synthetics, e.g. init
+}
+
+func (f *Function) exitBlock() {
+	old := f.currentBlock
+
+	f.Exit = f.newBasicBlock("exit")
+	f.currentBlock = f.Exit
+
+	ret := f.results()
+	results := make([]Value, len(ret))
+	// Run function calls deferred in this
+	// function when explicitly returning from it.
+	f.emit(new(RunDefers))
+	for i, r := range ret {
+		results[i] = emitLoad(f, r)
+	}
+
+	f.emit(&Return{Results: results})
+	f.currentBlock = old
 }
 
 // createSyntacticParams populates f.Params and generates code (spills
@@ -262,24 +298,24 @@ func (f *Function) createSyntacticParams(recv *ast.FieldList, functype *ast.Func
 				f.namedResults = append(f.namedResults, f.addLocalForIdent(n))
 			}
 		}
+
+		if len(f.namedResults) == 0 {
+			sig := f.Signature.Results()
+			for i := 0; i < sig.Len(); i++ {
+				v := f.addLocal(sig.At(i).Type(), sig.At(i).Pos())
+				v.Comment = fmt.Sprintf("ret.%d", i)
+				f.implicitResults = append(f.implicitResults, v)
+			}
+		}
 	}
 }
 
-// numberRegisters assigns numbers to all SSA registers
-// (value-defining Instructions) in f, to aid debugging.
-// (Non-Instruction Values are named at construction.)
-//
-func numberRegisters(f *Function) {
-	v := 0
+func numberNodes(f *Function) {
+	var base ID
 	for _, b := range f.Blocks {
 		for _, instr := range b.Instrs {
-			switch instr.(type) {
-			case Value:
-				instr.(interface {
-					setNum(int)
-				}).setNum(v)
-				v++
-			}
+			base++
+			instr.setID(base)
 		}
 	}
 }
@@ -301,6 +337,92 @@ func buildReferrers(f *Function) {
 			}
 		}
 	}
+}
+
+func (f *Function) emitConsts() {
+	if len(f.Blocks) == 0 {
+		f.consts = nil
+		return
+	}
+
+	if len(f.consts) == 0 {
+		return
+	} else if len(f.consts) <= 32 {
+		f.emitConstsFew()
+	} else {
+		f.emitConstsMany()
+	}
+}
+
+func (f *Function) emitConstsFew() {
+	dedup := make([]*Const, 0, 32)
+	for _, c := range f.consts {
+		if len(*c.Referrers()) == 0 {
+			continue
+		}
+		found := false
+		for _, d := range dedup {
+			if c.typ == d.typ && c.Value == d.Value {
+				replaceAll(c, d)
+				found = true
+				break
+			}
+		}
+		if !found {
+			dedup = append(dedup, c)
+		}
+	}
+
+	instrs := make([]Instruction, len(f.Blocks[0].Instrs)+len(dedup))
+	for i, c := range dedup {
+		instrs[i] = c
+		c.setBlock(f.Blocks[0])
+	}
+	copy(instrs[len(dedup):], f.Blocks[0].Instrs)
+	f.Blocks[0].Instrs = instrs
+	f.consts = nil
+}
+
+func (f *Function) emitConstsMany() {
+	type constKey struct {
+		typ   types.Type
+		value constant.Value
+	}
+
+	m := make(map[constKey]Value, len(f.consts))
+	areNil := 0
+	for i, c := range f.consts {
+		if len(*c.Referrers()) == 0 {
+			f.consts[i] = nil
+			areNil++
+			continue
+		}
+
+		k := constKey{
+			typ:   c.typ,
+			value: c.Value,
+		}
+		if dup, ok := m[k]; !ok {
+			m[k] = c
+		} else {
+			f.consts[i] = nil
+			areNil++
+			replaceAll(c, dup)
+		}
+	}
+
+	instrs := make([]Instruction, len(f.Blocks[0].Instrs)+len(f.consts)-areNil)
+	i := 0
+	for _, c := range f.consts {
+		if c != nil {
+			instrs[i] = c
+			c.setBlock(f.Blocks[0])
+			i++
+		}
+	}
+	copy(instrs[i:], f.Blocks[0].Instrs)
+	f.Blocks[0].Instrs = instrs
+	f.consts = nil
 }
 
 // finishBody() finalizes the function after SSA code generation of its body.
@@ -335,15 +457,22 @@ func (f *Function) finishBody() {
 	buildDomTree(f)
 
 	if f.Prog.mode&NaiveForm == 0 {
-		// For debugging pre-state of lifting pass:
-		// numberRegisters(f)
-		// f.WriteTo(os.Stderr)
 		lift(f)
 	}
 
-	f.namedResults = nil // (used by lifting)
+	// emit constants after lifting, because lifting may produce new constants.
+	f.emitConsts()
 
-	numberRegisters(f)
+	f.namedResults = nil // (used by lifting)
+	f.implicitResults = nil
+
+	numberNodes(f)
+
+	defer f.wr.Close()
+	f.wr.WriteFunc("start", "start", f)
+
+	phiElim(f)
+	f.wr.WriteFunc("phiElim", "phiElim", f)
 
 	if f.Prog.mode&PrintFunctions != 0 {
 		printMu.Lock()
@@ -353,6 +482,62 @@ func (f *Function) finishBody() {
 
 	if f.Prog.mode&SanityCheckFunctions != 0 {
 		mustSanityCheck(f, nil)
+	}
+}
+
+func phiElim(f *Function) {
+	for {
+		changed := false
+		for _, b := range f.Blocks {
+			for _, instr := range b.Instrs {
+				phi, ok := instr.(*Phi)
+				if !ok {
+					continue
+				}
+				if len(*phi.Referrers()) == 0 {
+					continue
+				}
+				var v0 Value
+				elim := true
+				for _, e := range phi.Edges {
+					if e == phi {
+						continue
+					}
+					if v0 == nil {
+						v0 = e
+					}
+					if v0 != e {
+						if v0, ok := v0.(*Const); ok {
+							if e, ok := e.(*Const); ok {
+								if v0.typ == e.typ && v0.Value == e.Value {
+									continue
+								}
+							}
+						}
+						elim = false
+						break
+					}
+				}
+				if elim {
+					changed = true
+					for _, ref := range *phi.Referrers() {
+						for _, op := range ref.Operands(nil) {
+							if *op == phi {
+								*op = v0
+								// Const don't currently track referrers
+								if _, ok := v0.(*Const); !ok {
+									*v0.Referrers() = append(*v0.Referrers(), ref)
+								}
+							}
+						}
+					}
+					*phi.Referrers() = nil
+				}
+			}
+		}
+		if !changed {
+			break
+		}
 	}
 }
 
@@ -573,10 +758,6 @@ func WriteFunction(buf *bytes.Buffer, f *Function) {
 		fmt.Fprintf(buf, "# Parent: %s\n", f.parent.Name())
 	}
 
-	if f.Recover != nil {
-		fmt.Fprintf(buf, "# Recover: %s\n", f.Recover)
-	}
-
 	from := f.pkg()
 
 	if f.FreeVars != nil {
@@ -629,6 +810,7 @@ func WriteFunction(buf *bytes.Buffer, f *Function) {
 				n, _ := buf.WriteString(instr.String())
 				l -= n
 				// Right-align the type if there's space.
+				// XXX don't print the type anymore once we've updated all instructions to show their own type
 				if t := v.Type(); t != nil {
 					buf.WriteByte(' ')
 					ts := relType(t, from)
@@ -699,3 +881,12 @@ func (n extentNode) End() token.Pos { return n[1] }
 // information; this avoids pinning the AST in memory.
 //
 func (f *Function) Syntax() ast.Node { return f.syntax }
+
+func (f *Function) initHTML(name string) {
+	if name == "" {
+		return
+	}
+	if rel := f.RelString(nil); rel == name {
+		f.wr = NewHTMLWriter("ssa.html", rel, "")
+	}
+}

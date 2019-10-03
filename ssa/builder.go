@@ -32,7 +32,7 @@ package ssa
 import (
 	"fmt"
 	"go/ast"
-	exact "go/constant"
+	"go/constant"
 	"go/token"
 	"go/types"
 	"os"
@@ -58,17 +58,14 @@ var (
 	tString     = types.Typ[types.String]
 	tUntypedNil = types.Typ[types.UntypedNil]
 	tRangeIter  = &opaqueType{nil, "iter"} // the type of all "range" iterators
-	tEface      = types.NewInterface(nil, nil).Complete()
-
-	// SSA Value constants.
-	vZero = intConst(0)
-	vOne  = intConst(1)
-	vTrue = NewConst(exact.MakeBool(true), tBool)
+	tEface      = types.NewInterfaceType(nil, nil).Complete()
 )
 
 // builder holds state associated with the package currently being built.
 // Its methods contain all the logic for AST-to-SSA conversion.
-type builder struct{}
+type builder struct {
+	printFunc string
+}
 
 // cond emits to fn code to evaluate boolean condition e and jump
 // to t or f depending on its value, performing various simplifications.
@@ -131,11 +128,11 @@ func (b *builder) logicalBinop(fn *Function, e *ast.BinaryExpr) Value {
 	switch e.Op {
 	case token.LAND:
 		b.cond(fn, e.X, rhs, done)
-		short = NewConst(exact.MakeBool(false), t)
+		short = emitConst(fn, NewConst(constant.MakeBool(false), t))
 
 	case token.LOR:
 		b.cond(fn, e.X, done, rhs)
-		short = NewConst(exact.MakeBool(true), t)
+		short = emitConst(fn, NewConst(constant.MakeBool(true), t))
 	}
 
 	// Is rhs unreachable?
@@ -176,8 +173,7 @@ func (b *builder) logicalBinop(fn *Function, e *ast.BinaryExpr) Value {
 //
 // Multi-result expressions include CallExprs in a multi-value
 // assignment or return statement, and "value,ok" uses of
-// TypeAssertExpr, IndexExpr (when X is a map), and UnaryExpr (when Op
-// is token.ARROW).
+// TypeAssertExpr, IndexExpr (when X is a map), and Recv.
 //
 func (b *builder) exprN(fn *Function, e ast.Expr) Value {
 	typ := fn.Pkg.typeOf(e).(*types.Tuple)
@@ -196,7 +192,7 @@ func (b *builder) exprN(fn *Function, e ast.Expr) Value {
 
 	case *ast.IndexExpr:
 		mapt := fn.Pkg.typeOf(e.X).Underlying().(*types.Map)
-		lookup := &Lookup{
+		lookup := &MapLookup{
 			X:       b.expr(fn, e.X),
 			Index:   emitConv(fn, b.expr(fn, e.Index), mapt.Key()),
 			CommaOk: true,
@@ -209,14 +205,7 @@ func (b *builder) exprN(fn *Function, e ast.Expr) Value {
 		return emitTypeTest(fn, b.expr(fn, e.X), typ.At(0).Type(), e.Lparen)
 
 	case *ast.UnaryExpr: // must be receive <-
-		unop := &UnOp{
-			Op:      token.ARROW,
-			X:       b.expr(fn, e.X),
-			CommaOk: true,
-		}
-		unop.setType(typ)
-		unop.setPos(e.OpPos)
-		return fn.emit(unop)
+		return emitRecv(fn, b.expr(fn, e.X), true, typ, e.OpPos)
 	}
 	panic(fmt.Sprintf("exprN(%T) in %s", e, fn))
 }
@@ -272,7 +261,7 @@ func (b *builder) builtin(fn *Function, obj *types.Builtin, args []ast.Expr, typ
 			return fn.emit(v)
 
 		case *types.Chan:
-			var sz Value = vZero
+			var sz Value = emitConst(fn, intConst(0))
 			if len(args) == 2 {
 				sz = b.expr(fn, args[1])
 			}
@@ -296,7 +285,7 @@ func (b *builder) builtin(fn *Function, obj *types.Builtin, args []ast.Expr, typ
 		t := deref(fn.Pkg.typeOf(args[0])).Underlying()
 		if at, ok := t.(*types.Array); ok {
 			b.expr(fn, args[0]) // for effects only
-			return intConst(at.Len())
+			return emitConst(fn, intConst(at.Len()))
 		}
 		// Otherwise treat as normal.
 
@@ -305,8 +294,9 @@ func (b *builder) builtin(fn *Function, obj *types.Builtin, args []ast.Expr, typ
 			X:   emitConv(fn, b.expr(fn, args[0]), tEface),
 			pos: pos,
 		})
+		addEdge(fn.currentBlock, fn.Exit)
 		fn.currentBlock = fn.newBasicBlock("unreachable")
-		return vTrue // any non-nil Value will do
+		return emitConst(fn, NewConst(constant.MakeBool(true), tBool)) // any non-nil Value will do
 	}
 	return nil // treat all others as a regular function call
 }
@@ -517,7 +507,7 @@ func (b *builder) expr(fn *Function, e ast.Expr) Value {
 
 	// Is expression a constant?
 	if tv.Value != nil {
-		return NewConst(tv.Value, tv.Type)
+		return emitConst(fn, NewConst(tv.Value, tv.Type))
 	}
 
 	var v Value
@@ -551,6 +541,7 @@ func (b *builder) expr0(fn *Function, e ast.Expr, tv types.TypeAndValue) Value {
 			syntax:    e,
 		}
 		fn.AnonFuncs = append(fn.AnonFuncs, fn2)
+		fn2.initHTML(b.printFunc)
 		b.buildFunction(fn2)
 		if fn2.FreeVars == nil {
 			return fn2
@@ -611,7 +602,7 @@ func (b *builder) expr0(fn *Function, e ast.Expr, tv types.TypeAndValue) Value {
 			return addr.address(fn)
 		case token.ADD:
 			return b.expr(fn, e.X)
-		case token.NOT, token.ARROW, token.SUB, token.XOR: // ! <- - ^
+		case token.NOT, token.SUB, token.XOR: // ! <- - ^
 			v := &UnOp{
 				Op: e.Op,
 				X:  b.expr(fn, e.X),
@@ -619,6 +610,8 @@ func (b *builder) expr0(fn *Function, e ast.Expr, tv types.TypeAndValue) Value {
 			v.setPos(e.OpPos)
 			v.setType(tv.Type)
 			return fn.emit(v)
+		case token.ARROW:
+			return emitRecv(fn, b.expr(fn, e.X), false, tv.Type, e.OpPos)
 		default:
 			panic(e.Op)
 		}
@@ -635,7 +628,7 @@ func (b *builder) expr0(fn *Function, e ast.Expr, tv types.TypeAndValue) Value {
 		case token.EQL, token.NEQ, token.GTR, token.LSS, token.LEQ, token.GEQ:
 			cmp := emitCompare(fn, e.Op, b.expr(fn, e.X), b.expr(fn, e.Y), e.OpPos)
 			// The type of x==y may be UntypedBool.
-			return emitConv(fn, cmp, DefaultType(tv.Type))
+			return emitConv(fn, cmp, types.Default(tv.Type))
 		default:
 			panic("illegal op in BinaryExpr: " + e.Op.String())
 		}
@@ -678,7 +671,7 @@ func (b *builder) expr0(fn *Function, e ast.Expr, tv types.TypeAndValue) Value {
 		case *types.Builtin:
 			return &Builtin{name: obj.Name(), sig: tv.Type.(*types.Signature)}
 		case *types.Nil:
-			return nilConst(tv.Type)
+			return emitConst(fn, nilConst(tv.Type))
 		}
 		// Package-level func or var?
 		if v := fn.Prog.packageLevelValue(obj); v != nil {
@@ -750,7 +743,7 @@ func (b *builder) expr0(fn *Function, e ast.Expr, tv types.TypeAndValue) Value {
 		case *types.Map:
 			// Maps are not addressable.
 			mapt := fn.Pkg.typeOf(e.X).Underlying().(*types.Map)
-			v := &Lookup{
+			v := &MapLookup{
 				X:     b.expr(fn, e.X),
 				Index: emitConv(fn, b.expr(fn, e.Index), mapt.Key()),
 			}
@@ -760,7 +753,7 @@ func (b *builder) expr0(fn *Function, e ast.Expr, tv types.TypeAndValue) Value {
 
 		case *types.Basic: // => string
 			// Strings are not addressable.
-			v := &Lookup{
+			v := &StringLookup{
 				X:     b.expr(fn, e.X),
 				Index: b.expr(fn, e.Index),
 			}
@@ -929,7 +922,7 @@ func (b *builder) emitCallArgs(fn *Function, sig *types.Signature, e *ast.CallEx
 		st := sig.Params().At(np).Type().(*types.Slice)
 		vt := st.Elem()
 		if len(varargs) == 0 {
-			args = append(args, nilConst(st))
+			args = append(args, emitConst(fn, nilConst(st)))
 		} else {
 			// Replace a suffix of args with a slice containing it.
 			at := types.NewArray(vt, int64(len(varargs)))
@@ -939,7 +932,7 @@ func (b *builder) emitCallArgs(fn *Function, sig *types.Signature, e *ast.CallEx
 			for i, arg := range varargs {
 				iaddr := &IndexAddr{
 					X:     a,
-					Index: intConst(int64(i)),
+					Index: emitConst(fn, intConst(int64(i))),
 				}
 				iaddr.setType(types.NewPointer(vt))
 				fn.emit(iaddr)
@@ -969,10 +962,10 @@ func (b *builder) setCall(fn *Function, e *ast.CallExpr, c *CallCommon) {
 	c.Args = b.emitCallArgs(fn, sig, e, c.Args)
 }
 
-// assignOp emits to fn code to perform loc += incr or loc -= incr.
-func (b *builder) assignOp(fn *Function, loc lvalue, incr Value, op token.Token, pos token.Pos) {
+// assignOp emits to fn code to perform loc <op>= val.
+func (b *builder) assignOp(fn *Function, loc lvalue, val Value, op token.Token, pos token.Pos) {
 	oldv := loc.load(fn)
-	loc.store(fn, emitArith(fn, op, oldv, emitConv(fn, incr, oldv.Type()), loc.typ(), pos))
+	loc.store(fn, emitArith(fn, op, oldv, emitConv(fn, val, oldv.Type()), loc.typ(), pos))
 }
 
 // localValueSpec emits to fn code to define all of the vars in the
@@ -1163,7 +1156,7 @@ func (b *builder) compLit(fn *Function, addr Value, e *ast.CompositeLit, isZero 
 				if idx != nil {
 					idxval = idx.Int64() + 1
 				}
-				idx = intConst(idxval)
+				idx = emitConst(fn, intConst(idxval))
 			}
 			iaddr := &IndexAddr{
 				X:     array,
@@ -1187,7 +1180,7 @@ func (b *builder) compLit(fn *Function, addr Value, e *ast.CompositeLit, isZero 
 		}
 
 	case *types.Map:
-		m := &MakeMap{Reserve: intConst(int64(len(e.Elts)))}
+		m := &MakeMap{Reserve: emitConst(fn, intConst(int64(len(e.Elts))))}
 		m.setPos(e.Lbrace)
 		m.setType(typ)
 		fn.emit(m)
@@ -1242,7 +1235,7 @@ func (b *builder) switchStmt(fn *Function, s *ast.SwitchStmt, label *lblock) {
 	if s.Init != nil {
 		b.stmt(fn, s.Init)
 	}
-	var tag Value = vTrue
+	var tag Value = emitConst(fn, NewConst(constant.MakeBool(true), tBool))
 	if s.Tag != nil {
 		tag = b.expr(fn, s.Tag)
 	}
@@ -1399,7 +1392,7 @@ func (b *builder) typeSwitchStmt(fn *Function, s *ast.TypeSwitchStmt, label *lbl
 			casetype = fn.Pkg.typeOf(cond)
 			var condv Value
 			if casetype == tUntypedNil {
-				condv = emitCompare(fn, token.EQL, x, nilConst(x.Type()), token.NoPos)
+				condv = emitCompare(fn, token.EQL, x, emitConst(fn, nilConst(x.Type())), token.NoPos)
 				ti = x
 			} else {
 				yok := emitTypeTest(fn, x, casetype, cc.Case)
@@ -1545,7 +1538,6 @@ func (b *builder) selectStmt(fn *Function, s *ast.SelectStmt, label *lblock) {
 		}
 	}
 	sel.setType(types.NewTuple(vars...))
-
 	fn.emit(sel)
 	idx := emitExtract(fn, sel, 0)
 
@@ -1565,7 +1557,7 @@ func (b *builder) selectStmt(fn *Function, s *ast.SelectStmt, label *lblock) {
 		}
 		body := fn.newBasicBlock("select.body")
 		next := fn.newBasicBlock("select.next")
-		emitIf(fn, emitCompare(fn, token.EQL, idx, intConst(int64(state)), token.NoPos), body, next)
+		emitIf(fn, emitCompare(fn, token.EQL, idx, emitConst(fn, intConst(int64(state))), token.NoPos), body, next)
 		fn.currentBlock = body
 		fn.targets = &targets{
 			tail:   fn.targets,
@@ -1616,8 +1608,9 @@ func (b *builder) selectStmt(fn *Function, s *ast.SelectStmt, label *lblock) {
 		// A blocking select must match some case.
 		// (This should really be a runtime.errorString, not a string.)
 		fn.emit(&Panic{
-			X: emitConv(fn, stringConst("blocking select matched no case"), tEface),
+			X: emitConv(fn, emitConst(fn, stringConst("blocking select matched no case")), tEface),
 		})
+		addEdge(fn.currentBlock, fn.Exit)
 		fn.currentBlock = fn.newBasicBlock("unreachable")
 	}
 	emitJump(fn, done)
@@ -1707,7 +1700,7 @@ func (b *builder) rangeIndexed(fn *Function, x Value, tv types.Type, pos token.P
 		// elimination if x is pure, static unrolling, etc.
 		// Ranging over a nil *array may have >0 iterations.
 		// We still generate code for x, in case it has effects.
-		length = intConst(arr.Len())
+		length = emitConst(fn, intConst(arr.Len()))
 	} else {
 		// length = len(x).
 		var c Call
@@ -1718,7 +1711,7 @@ func (b *builder) rangeIndexed(fn *Function, x Value, tv types.Type, pos token.P
 	}
 
 	index := fn.addLocal(tInt, token.NoPos)
-	emitStore(fn, index, intConst(-1), pos)
+	emitStore(fn, index, emitConst(fn, intConst(-1)), pos)
 
 	loop = fn.newBasicBlock("rangeindex.loop")
 	emitJump(fn, loop)
@@ -1727,7 +1720,7 @@ func (b *builder) rangeIndexed(fn *Function, x Value, tv types.Type, pos token.P
 	incr := &BinOp{
 		Op: token.ADD,
 		X:  emitLoad(fn, index),
-		Y:  vOne,
+		Y:  emitConst(fn, intConst(1)),
 	}
 	incr.setType(tInt)
 	emitStore(fn, index, fn.emit(incr), pos)
@@ -1855,23 +1848,13 @@ func (b *builder) rangeChan(fn *Function, x Value, tk types.Type, pos token.Pos)
 	loop = fn.newBasicBlock("rangechan.loop")
 	emitJump(fn, loop)
 	fn.currentBlock = loop
-	recv := &UnOp{
-		Op:      token.ARROW,
-		X:       x,
-		CommaOk: true,
-	}
-	recv.setPos(pos)
-	recv.setType(types.NewTuple(
-		newVar("k", x.Type().Underlying().(*types.Chan).Elem()),
-		varOk,
-	))
-	ko := fn.emit(recv)
+	retv := emitRecv(fn, x, true, types.NewTuple(newVar("k", x.Type().Underlying().(*types.Chan).Elem()), varOk), pos)
 	body := fn.newBasicBlock("rangechan.body")
 	done = fn.newBasicBlock("rangechan.done")
-	emitIf(fn, emitExtract(fn, ko, 1), body, done)
+	emitIf(fn, emitExtract(fn, retv, 1), body, done)
 	fn.currentBlock = body
 	if tk != nil {
-		k = emitExtract(fn, ko, 0)
+		k = emitExtract(fn, retv, 0)
 	}
 	return
 }
@@ -1985,12 +1968,13 @@ start:
 		b.expr(fn, s.X)
 
 	case *ast.SendStmt:
-		fn.emit(&Send{
+		instr := &Send{
 			Chan: b.expr(fn, s.Chan),
 			X: emitConv(fn, b.expr(fn, s.Value),
 				fn.Pkg.typeOf(s.Chan).Underlying().(*types.Chan).Elem()),
 			pos: s.Arrow,
-		})
+		}
+		fn.emit(instr)
 
 	case *ast.IncDecStmt:
 		op := token.ADD
@@ -1998,7 +1982,7 @@ start:
 			op = token.SUB
 		}
 		loc := b.addr(fn, s.X, false)
-		b.assignOp(fn, loc, NewConst(exact.MakeInt64(1), loc.typ()), op, s.Pos())
+		b.assignOp(fn, loc, emitConst(fn, NewConst(constant.MakeInt64(1), loc.typ())), op, s.Pos())
 
 	case *ast.AssignStmt:
 		switch s.Tok {
@@ -2022,11 +2006,8 @@ start:
 		// panic is treated like an ordinary function call.
 		v := Defer{pos: s.Defer}
 		b.setCall(fn, s.Call, &v.Call)
+		fn.hasDefer = true
 		fn.emit(&v)
-
-		// A deferred call can cause recovery from panic,
-		// and control resumes at the Recover block.
-		createRecoverBlock(fn)
 
 	case *ast.ReturnStmt:
 		var results []Value
@@ -2046,24 +2027,13 @@ start:
 				results = append(results, v)
 			}
 		}
-		if fn.namedResults != nil {
-			// Function has named result parameters (NRPs).
-			// Perform parallel assignment of return operands to NRPs.
-			for i, r := range results {
-				emitStore(fn, fn.namedResults[i], r, s.Return)
-			}
+
+		ret := fn.results()
+		for i, r := range results {
+			emitStore(fn, ret[i], r, s.Return)
 		}
-		// Run function calls deferred in this
-		// function when explicitly returning from it.
-		fn.emit(new(RunDefers))
-		if fn.namedResults != nil {
-			// Reload NRPs to form the result tuple.
-			results = results[:0]
-			for _, r := range fn.namedResults {
-				results = append(results, emitLoad(fn, r))
-			}
-		}
-		fn.emit(&Return{Results: results, pos: s.Return})
+
+		emitJump(fn, fn.Exit)
 		fn.currentBlock = fn.newBasicBlock("unreachable")
 
 	case *ast.BranchStmt:
@@ -2192,8 +2162,9 @@ func (b *builder) buildFunction(fn *Function) {
 	}
 	fn.startBody()
 	fn.createSyntacticParams(recvField, functype)
+	fn.exitBlock()
 	b.stmt(fn, body)
-	if cb := fn.currentBlock; cb != nil && (cb == fn.Blocks[0] || cb == fn.Recover || cb.Preds != nil) {
+	if cb := fn.currentBlock; cb != nil && (cb == fn.Blocks[0] || cb.Preds != nil) {
 		// Control fell off the end of the function's body block.
 		//
 		// Block optimizations eliminate the current block, if
@@ -2201,8 +2172,9 @@ func (b *builder) buildFunction(fn *Function) {
 		// if this no-arg return is ill-typed for
 		// fn.Signature.Results, this block must be
 		// unreachable.  The sanity checker checks this.
-		fn.emit(new(RunDefers))
-		fn.emit(new(Return))
+		// fn.emit(new(RunDefers))
+		// fn.emit(new(Return))
+		emitJump(fn, fn.Exit)
 	}
 	fn.finishBody()
 }
@@ -2277,33 +2249,34 @@ func (p *Package) build() {
 	}
 	init := p.init
 	init.startBody()
+	init.exitBlock()
 
 	var done *BasicBlock
 
-	if p.Prog.mode&BareInits == 0 {
-		// Make init() skip if package is already initialized.
-		initguard := p.Var("init$guard")
-		doinit := init.newBasicBlock("init.start")
-		done = init.newBasicBlock("init.done")
-		emitIf(init, emitLoad(init, initguard), done, doinit)
-		init.currentBlock = doinit
-		emitStore(init, initguard, vTrue, token.NoPos)
+	// Make init() skip if package is already initialized.
+	initguard := p.Var("init$guard")
+	doinit := init.newBasicBlock("init.start")
+	done = init.newBasicBlock("init.done")
+	emitIf(init, emitLoad(init, initguard), done, doinit)
+	init.currentBlock = doinit
+	emitStore(init, initguard, emitConst(init, NewConst(constant.MakeBool(true), tBool)), token.NoPos)
 
-		// Call the init() function of each package we import.
-		for _, pkg := range p.Pkg.Imports() {
-			prereq := p.Prog.packages[pkg]
-			if prereq == nil {
-				panic(fmt.Sprintf("Package(%q).Build(): unsatisfied import: Program.CreatePackage(%q) was not called", p.Pkg.Path(), pkg.Path()))
-			}
-			var v Call
-			v.Call.Value = prereq.init
-			v.Call.pos = init.pos
-			v.setType(types.NewTuple())
-			init.emit(&v)
+	// Call the init() function of each package we import.
+	for _, pkg := range p.Pkg.Imports() {
+		prereq := p.Prog.packages[pkg]
+		if prereq == nil {
+			panic(fmt.Sprintf("Package(%q).Build(): unsatisfied import: Program.CreatePackage(%q) was not called", p.Pkg.Path(), pkg.Path()))
 		}
+		var v Call
+		v.Call.Value = prereq.init
+		v.Call.pos = init.pos
+		v.setType(types.NewTuple())
+		init.emit(&v)
 	}
 
-	var b builder
+	b := builder{
+		printFunc: p.printFunc,
+	}
 
 	// Initialize package-level vars in correct order.
 	for _, varinit := range p.info.InitOrder {
@@ -2344,11 +2317,10 @@ func (p *Package) build() {
 	}
 
 	// Finish up init().
-	if p.Prog.mode&BareInits == 0 {
-		emitJump(init, done)
-		init.currentBlock = done
-	}
+	emitJump(init, done)
+	init.currentBlock = done
 	init.emit(new(Return))
+	addEdge(init.currentBlock, init.Exit)
 	init.finishBody()
 
 	p.info = nil // We no longer need ASTs or go/types deductions.
